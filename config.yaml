@@ -1,0 +1,8 @@
+endpoints:
+  api_base: 'https://api.bilibili.tv/intl/gateway'
+  season_info: 'https://api.bilibili.tv/intl/gateway/web/v2/ogv/play/season_info?season_id={}&platform=web'
+  season_episodes: 'https://api.bilibili.tv/intl/gateway/web/v2/ogv/play/episodes?season_id={}&platform=web'
+  episode_info: 'https://api.bilibili.tv/intl/gateway/web/v2/ogv/play/episode?episode_id={}&platform=web'
+  playurl: 'https://api.bilibili.tv/intl/gateway/web/playurl'
+  subtitle: 'https://api.bilibili.tv/intl/gateway/web/v2/subtitle'
+  ugc_view: 'https://api.bilibili.tv/intl/gateway/web/view/ugc/season?aid={}&platform=web'
