@@ -1,6 +1,6 @@
-# Bilibili International Service for Unshackle
+# bilibili.tv Service for Unshackle
 
-A service for [Unshackle](https://github.com/unshackle-dl/unshackle) for downloading content from **Bilibili International (bilibili.tv)**.
+A service for [Unshackle](https://github.com/unshackle-dl/unshackle) for downloading content from **bilibili.tv**.
 
 **Supported URLs**
 
@@ -9,4 +9,4 @@ A service for [Unshackle](https://github.com/unshackle-dl/unshackle) for downloa
 
 **Authentication**
 
-Premium content and higher quality streams require cookies.
+Premium content and higher quality streams require cookies or credentials from a premium account.
