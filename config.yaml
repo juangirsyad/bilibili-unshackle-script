@@ -7,11 +7,5 @@ endpoints:
   subtitle: 'https://api.bilibili.tv/intl/gateway/web/v2/subtitle'
   ugc_view: 'https://api.bilibili.tv/intl/gateway/web/view/ugc/season?aid={}&platform=web'
 
-  # ── Credential (username:password) login — CONFIRMED via browser DevTools ──
-  # against the live bilibili.tv login flow (both requests returned 200 OK
-  # and the login POST set SESSDATA / bili_jct / DedeUserID / mid cookies).
-  # Query params `s_locale=en_US&platform=web` are appended by BILI.py itself.
-  # NOTE: passport_login MUST end in "/password" — this is the actual path
-  # the browser hits (confirmed via a captured cURL), not just ".../login".
   passport_key: 'https://passport.bilibili.tv/x/intl/passport-login/web/key'
   passport_login: 'https://passport.bilibili.tv/x/intl/passport-login/web/login/password'
