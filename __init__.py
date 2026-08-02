@@ -15,7 +15,10 @@ class BILI(Service):
     Service code for Bilibili International (https://bilibili.tv).
 
     \b
-    Authorization: Cookies
+    Author: juangirsyad
+    Date: 2026-08-02
+    Authorization: Cookies, Credentials
+                   Required for premium content and higher quality streams.
     Security: No DRM
     Region: bilibili.tv (international)
 
@@ -25,18 +28,11 @@ class BILI(Service):
       Episode: https://www.bilibili.tv/play/{season_id}/{ep_id}
     """
 
-    ALIASES = ["BILI", "bili", "bilibili"]
-    # Matches:
-    #   https://www.bilibili.tv/play/2412684              (movie / series root)
-    #   https://www.bilibili.tv/play/2342380/27392045     (episode)
-    #   optional language prefix: /en/, /th/, etc.
+    ALIASES = ["BILI", "bilibili", "bstation"]
     TITLE_RE = (
         r"^(?:https?://(?:www\.)?bili(?:bili\.tv|intl\.com)/)"
         r"(?:[a-zA-Z]{2}/)?"
-        r"(?:"
         r"(?:play|media)/(?P<season_id>\d+)(?:/(?P<ep_id>\d+))?"
-        r"|video/(?P<aid>\d+)"
-        r")"
     )
 
     @staticmethod
@@ -49,6 +45,13 @@ class BILI(Service):
     def __init__(self, ctx, title):
         super().__init__(ctx)
         self.title = title
+
+
+    def _exit(self, message: str) -> Exception:
+        if hasattr(self.log, "exit"):
+            return self.log.exit(message)
+        self.log.error(message)
+        return SystemExit(1)
 
     def authenticate(
         self,
@@ -71,24 +74,149 @@ class BILI(Service):
             }
         )
 
+        if not cookies and credential:
+            self._login_with_credential(credential)
+
+    def _login_with_credential(self, credential: Credential) -> None:
+        endpoints = self.config.get("endpoints", {})
+        key_url = endpoints.get("passport_key")
+        login_url = endpoints.get("passport_login")
+        if not key_url or not login_url:
+            raise self._exit(
+                "Credential login isn't configured. Add 'passport_key' and "
+                "'passport_login' entries under 'endpoints' in your Bilibili "
+                "config.yaml (see _login_with_credential()'s docstring for "
+                "how to find the real values), or use cookies instead."
+            )
+
+        try:
+            self.session.get("https://www.bilibili.tv/en", timeout=15)
+        except Exception as e:
+            self.log.debug(f"Could not pre-fetch bilibili.tv homepage for device cookies: {e}")
+
+        locale_params = {"s_locale": "en_US", "platform": "web"}
+
+        key_raw = self.session.get(key_url, params=locale_params)
+        try:
+            key_resp = key_raw.json()
+        except Exception:
+            raise self._exit(
+                f"Bilibili login-key endpoint returned a non-JSON response "
+                f"(HTTP {key_raw.status_code}): {key_raw.text[:200]!r}"
+            )
+
+        if key_resp.get("code", 0) != 0:
+            raise self._exit(
+                f"Bilibili login-key request failed (code {key_resp.get('code')}): "
+                f"{key_resp.get('message')}"
+            )
+
+        key_data = key_resp.get("data") or {}
+        salt = self._first_present(key_data, self._KEY_SALT_FIELDS)
+        pub_key_pem = self._first_present(key_data, self._KEY_PUBKEY_FIELDS)
+        if not salt or not pub_key_pem:
+            raise self._exit(
+                f"Bilibili login-key response is missing a salt/public-key field "
+                f"(looked for {self._KEY_SALT_FIELDS} / {self._KEY_PUBKEY_FIELDS}, "
+                f"got keys: {list(key_data.keys())}). Open {key_url} directly in "
+                f"a browser to inspect the real field names and update "
+                f"_KEY_SALT_FIELDS / _KEY_PUBKEY_FIELDS in BILI.py accordingly."
+            )
+
+        encrypted_password = self._rsa_encrypt_password(salt, credential.password, pub_key_pem)
+
+        login_raw = self.session.post(
+            login_url,
+            params=locale_params,
+            headers={
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-site",
+            },
+            data={
+                "username": credential.username,
+                "password": encrypted_password,
+                "keep_me": "false",
+                "go_url": "https://www.bilibili.tv/en",
+            },
+        )
+        try:
+            login_resp = login_raw.json()
+        except Exception:
+            raise self._exit(
+                f"Bilibili login endpoint returned a non-JSON response "
+                f"(HTTP {login_raw.status_code}): {login_raw.text[:200]!r}"
+            )
+
+        code = login_resp.get("code", 0)
+        if code in (-105, 2406, 86001):
+            raise self._exit(
+                "Bilibili is asking for a captcha on this login. Use cookies instead."
+            )
+        if code != 0:
+            raise self._exit(
+                f"Bilibili credential login failed {code}: "
+                f"{login_resp.get('message')}"
+            )
+
+        if not self.session.cookies.get("SESSDATA"):
+            self.log.warning(
+                "Bilibili login request returned code 0 but no SESSDATA cookie "
+                "was set. Double check the login actually succeeded."
+            )
+        else:
+            self.log.info(f"Logged in to Bilibili as {credential.username!r}")
+
+    _KEY_SALT_FIELDS = ("hash", "salt")
+    _KEY_PUBKEY_FIELDS = ("key", "pub_key", "pubKey", "public_key")
+
+    @staticmethod
+    def _first_present(data: dict, keys: tuple) -> Optional[str]:
+        """Return the value of the first key in `keys` that exists (and is truthy) in `data`."""
+        for key in keys:
+            value = data.get(key)
+            if value:
+                return value
+        return None
+
+    @staticmethod
+    def _rsa_encrypt_password(salt: str, password: str, pub_key_pem: str) -> str:
+        """RSA-encrypt `salt + password` (PKCS#1 v1.5) with the server-provided
+        PEM public key, base64-encoded — matching bilibili's own web client.
+
+        Uses the `cryptography` package, which is already a dependency of
+        most requests/TLS stacks, so no extra install should be needed.
+        """
+        import base64
+
+        from cryptography.hazmat.primitives.asymmetric import padding
+        from cryptography.hazmat.primitives.serialization import load_pem_public_key
+
+        pub_key = load_pem_public_key(pub_key_pem.encode())
+        encrypted = pub_key.encrypt((salt + password).encode(), padding.PKCS1v15())
+        return base64.b64encode(encrypted).decode()
+
+
+    def _raise_for_code(self, code: int, msg: str) -> None:
+        """Raise a clear, correctly-labeled error for a known Bilibili API error code."""
+        if code in (10004004, 10004005, 10023006):
+            raise self._exit(
+                "This content requires a premium account. "
+                "Please provide cookies or credentials from a premium account."
+            )
+        if code == 10004001:
+            raise self._exit(f"Content is geo-restricted in your region: {code}")
+        raise self._exit(f"API error: {code}")
+
     def _call_api(self, url: str, video_id: str, **kwargs) -> dict:
         """Call a Bilibili TV API endpoint and raise on error codes."""
         resp = self.session.get(url, **kwargs).json()
         code = resp.get("code", 0)
         if code != 0:
-            # 10004004 / 10004005 / 10023006 → login required
-            # 10004001 → geo-restricted
-            msg = resp.get("message", str(code))
-            if code in (10004004, 10004005, 10023006):
-                raise self.log.exit(
-                    f"Content requires login (code {code}): {msg}"
-                )
-            elif code == 10004001:
-                raise self.log.exit(
-                    f"Content is geo-restricted in your region (code {code}): {msg}"
-                )
-            else:
-                raise self.log.exit(f"API error (code {code}): {msg}")
+            self._raise_for_code(code, resp.get("message", str(code)))
         return resp.get("data") or {}
 
     def _get_season_info(self, season_id: str) -> dict:
@@ -107,6 +235,7 @@ class BILI(Service):
         url = self.config["endpoints"]["episode_info"].format(ep_id)
         return self._call_api(url, ep_id)
 
+
     def get_titles(self) -> Union[Movies, Series]:
         match = re.match(self.TITLE_RE, self.title)
         if not match:
@@ -114,37 +243,17 @@ class BILI(Service):
                 "Could not parse ID from URL — is the URL correct?\n"
                 "Supported formats:\n"
                 "  https://www.bilibili.tv/play/{season_id}\n"
-                "  https://www.bilibili.tv/play/{season_id}/{ep_id}\n"
+                "  https://www.bilibili.tv/play/{season_id}/{ep_id}"
             )
 
         season_id = match.group("season_id")
         ep_id = match.group("ep_id")
-        aid = match.group("aid")
 
-        self.log.debug(f"season_id={season_id!r}  ep_id={ep_id!r}  aid={aid!r}")
-
-        if aid:
-            ugc_url = self.config["endpoints"]["ugc_view"].format(aid)
-            ugc_data = self._call_api(ugc_url, aid)
-            archive = ugc_data.get("archive") or {}
-            return Movies(
-                [
-                    Movie(
-                        id_=aid,
-                        service=self.__class__,
-                        name=archive.get("title", aid),
-                        year=None,
-                        data={"aid": aid, "archive": archive},
-                        language="und",
-                    )
-                ]
-            )
+        self.log.debug(f"season_id={season_id!r}  ep_id={ep_id!r}")
 
         season_info = self._get_season_info(season_id)
         raw_season_title = season_info.get("title", season_id)
         season_type = season_info.get("type", 0)
-        # type: 1 = movie, 2 = documentary, 4 = drama, 5 = variety …
-        # Only type 1 is typically a single-episode "movie" on bilibili.tv
         is_movie = season_type == 1
 
         dub_lang = self._detect_dub_language(raw_season_title)
@@ -154,14 +263,14 @@ class BILI(Service):
 
         episodes_data = self._get_season_episodes(season_id)
         if not episodes_data:
-            raise self.log.exit(f"No episodes found for season {season_id}")
+            raise self._exit(f"No episodes found for season {season_id}")
 
         if ep_id:
             episodes_data = [
                 ep for ep in episodes_data if str(ep.get("episode_id")) == ep_id
             ]
             if not episodes_data:
-                raise self.log.exit(
+                raise self._exit(
                     f"Episode {ep_id} not found in season {season_id}"
                 )
 
@@ -173,7 +282,6 @@ class BILI(Service):
                         id_=str(ep["episode_id"]),
                         service=self.__class__,
                         name=season_title,
-                        year=self._parse_year(season_info),
                         data={
                             "ep_id": str(ep["episode_id"]),
                             "season_id": season_id,
@@ -200,7 +308,6 @@ class BILI(Service):
                     name=ep_clean_name,
                     season=int(ep_season),
                     number=int(ep_number) if ep_number else 0,
-                    year=self._parse_year(season_info),
                     data={
                         "ep_id": str(ep["episode_id"]),
                         "season_id": season_id,
@@ -212,31 +319,22 @@ class BILI(Service):
             )
         return Series(titles)
 
+
     def get_tracks(self, title: Union[Movie, Episode]):
         ep_id: Optional[str] = title.data.get("ep_id")
-        aid: Optional[str] = title.data.get("aid")
 
         params: dict = {"platform": "web"}
         if ep_id:
             params["ep_id"] = ep_id
-        elif aid:
-            params["aid"] = aid
         else:
-            raise self.log.exit("Cannot determine ep_id or aid for this title")
+            raise self._exit("Cannot determine ep_id for this title")
 
         playurl_resp = self.session.get(
             self.config["endpoints"]["playurl"], params=params
         ).json()
 
         if playurl_resp.get("code", 0) != 0:
-            msg = playurl_resp.get("message", "")
-            code = playurl_resp.get("code")
-            if code in (10004004, 10004005, 10023006):
-                raise self.log.exit(
-                    "This quality / content requires a premium account. "
-                    "Please provide cookies from a logged-in premium account."
-                )
-            raise self.log.exit(f"playurl error ({code}): {msg}")
+            self._raise_for_code(playurl_resp.get("code"), playurl_resp.get("message", ""))
 
         playurl_data = (playurl_resp.get("data") or {}).get("playurl") or {}
 
@@ -315,16 +413,12 @@ class BILI(Service):
         sub_params: dict = {"platform": "web", "s_locale": "en_US"}
         if ep_id:
             sub_params["episode_id"] = ep_id
-        elif aid:
-            sub_params["aid"] = aid
 
         sub_resp = self.session.get(
             self.config["endpoints"]["subtitle"], params=sub_params
         ).json()
         sub_data = (sub_resp.get("data") or {})
 
-        # Prefer 'subtitles' list; fall back to 'video_subtitle' if empty.
-        # Both keys can carry the same languages — using only one avoids duplicates.
         sub_list = sub_data.get("subtitles") or sub_data.get("video_subtitle") or []
 
         seen_lang_ext: set[tuple] = set()
@@ -340,7 +434,6 @@ class BILI(Service):
                 if ext not in ("ass", "srt", "vtt"):
                     ext = "srt"
 
-                # Skip if we already have this language+format combination
                 key = (lang_key, ext)
                 if key in seen_lang_ext:
                     continue
@@ -367,6 +460,7 @@ class BILI(Service):
 
         return tracks
 
+
     def get_chapters(self, title: Union[Movie, Episode]) -> Chapters:
         ep_id: Optional[str] = title.data.get("ep_id")
         if not ep_id:
@@ -382,9 +476,7 @@ class BILI(Service):
         opening_start = self._ms_to_sec(skip.get("opening_start_time"))
         opening_end = self._ms_to_sec(skip.get("opening_end_time"))
         ending_start = self._ms_to_sec(skip.get("ending_start_time"))
-        ending_end = self._ms_to_sec(skip.get("ending_end_time"))
 
-        # Build chapter list from skip markers
         chapters.append(Chapter(timestamp=0))
 
         if opening_start is not None:
@@ -403,15 +495,10 @@ class BILI(Service):
 
         return Chapters(unique)
 
+
     def get_widevine_license(self, *, challenge: bytes, title, track) -> None:
         return None
 
-    @staticmethod
-    def _parse_year(season_info: dict) -> Optional[int]:
-        """Try to extract a 4-digit year from season metadata."""
-        pub = season_info.get("pub_time") or season_info.get("release_date") or ""
-        m = re.search(r"(\d{4})", pub)
-        return int(m.group(1)) if m else None
 
     @staticmethod
     def _extract_ep_number(title_display: str) -> Optional[int]:
@@ -430,7 +517,7 @@ class BILI(Service):
             return None
 
     def _is_2160p_requested(self) -> bool:
-        """Check if 2160p should be included (either --list mode is active, or -q requested 2160p/4K)."""
+        """Check if 2160p should be included (either --list mode is active, or -q requested 2160p)."""
         ctx = self.ctx
         while ctx:
             params = getattr(ctx, "params", {}) or {}
@@ -472,7 +559,6 @@ class BILI(Service):
         Handles patterns like:
           '(Dub Indo)', '（Dub Indo）', '[Dub Korean]', 'Dub Thai', etc.
         """
-        # Bracketed match: supports ASCII (), [], {} and CJK full-width （）, 【】, ［］, 〔〕
         m = re.search(
             r"[\(\[\{\（\【\［\〔]\s*(?:dub|dubbed|audio)?\s*([a-zA-Z]+)\s*(?:dub|dubbed|audio)?\s*[\)\]\}\）\】\］\〕]",
             title, re.IGNORECASE,
@@ -482,7 +568,6 @@ class BILI(Service):
             if kw in cls._DUB_LANG_MAP:
                 return cls._DUB_LANG_MAP[kw]
 
-        # Standalone "Dub <Lang>" or "<Lang> Dub"
         m = re.search(r"\b(?:dub|dubbed)\s+([a-zA-Z]+)\b|\b([a-zA-Z]+)\s+(?:dub|dubbed)\b", title, re.IGNORECASE)
         if m:
             kw = (m.group(1) or m.group(2)).lower()
@@ -515,7 +600,7 @@ class BILI(Service):
 
     @classmethod
     def _strip_dub_suffix(cls, title: str) -> str:
-        """Remove dub/sub language suffixes from a season title.
+        """Remove dub language suffixes from a season title.
 
         Examples:
           'MARRIAGETOXIN (Dub Indo)'  → 'MARRIAGETOXIN'
@@ -541,10 +626,8 @@ class BILI(Service):
             "", name, flags=re.IGNORECASE,
         )
 
-        # Remove leading/trailing E1, E01, Ep 1, Episode 1, etc.
         name = re.sub(r"^(?:E|Ep|Episode)?\s*\d+\s*[:\-\u2013]?\s*", "", name, flags=re.IGNORECASE).strip()
 
-        # stripped everything away).
         return name or season_title
 
     @staticmethod
