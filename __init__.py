@@ -154,11 +154,12 @@ class BILI(Service):
         code = login_resp.get("code", 0)
         if code in (-105, 2406, 86001):
             raise self._exit(
-                "Bilibili is asking for a captcha on this login. Use cookies instead."
+                "Bilibili is asking for a captcha on this login, try again later"
+                "or use cookies instead."
             )
         if code != 0:
             raise self._exit(
-                f"Bilibili credential login failed {code}: "
+                f"Bilibili credential login failed: "
                 f"{login_resp.get('message')}"
             )
 
@@ -544,12 +545,6 @@ class BILI(Service):
         "en": "en", "eng": "en", "english": "en",
         "ms": "ms", "malay": "ms", "melayu": "ms",
         "vi": "vi", "viet": "vi", "vietnamese": "vi",
-        "ar": "ar", "arabic": "ar",
-        "es": "es", "spanish": "es",
-        "pt": "pt", "portuguese": "pt",
-        "fr": "fr", "french": "fr",
-        "de": "de", "german": "de",
-        "tr": "tr", "turkish": "tr",
     }
 
     @classmethod
@@ -557,7 +552,7 @@ class BILI(Service):
         """Return a BCP-47 language code if the title contains a dub indicator.
 
         Handles patterns like:
-          '(Dub Indo)', '（Dub Indo）', '[Dub Korean]', 'Dub Thai', etc.
+          '(Dub Indo)', '（Dub Indo）', '[Dub Thai]', 'Dub Thai', etc.
         """
         m = re.search(
             r"[\(\[\{\（\【\［\〔]\s*(?:dub|dubbed|audio)?\s*([a-zA-Z]+)\s*(?:dub|dubbed|audio)?\s*[\)\]\}\）\】\］\〕]",
